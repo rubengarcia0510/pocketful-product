@@ -64,6 +64,58 @@ def isolated_conn(tmp_path):
     conn.close()
 
 
+@pytest.fixture
+def isolated_db_path(tmp_path):
+    """Provide an isolated DB file path with schema applied, for concurrent tests.
+
+    Returns the file path (str). Each thread is expected to open its own
+    SQLite connection against that path — sharing a single connection
+    across threads is not safe even with ``check_same_thread=False``.
+    """
+    path = str(tmp_path / "concurrent.db")
+
+    setup_conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+    setup_conn.row_factory = sqlite3.Row
+    setup_conn.execute("PRAGMA journal_mode = WAL")
+    setup_conn.execute("PRAGMA busy_timeout = 5000")
+
+    setup_conn.execute(
+        "CREATE TABLE users ("
+        "  id TEXT PRIMARY KEY,"
+        "  email TEXT NOT NULL UNIQUE,"
+        "  password_hash TEXT NOT NULL,"
+        "  display_name TEXT NOT NULL,"
+        "  handle TEXT NOT NULL UNIQUE,"
+        "  balance INTEGER NOT NULL DEFAULT 0,"
+        "  currency TEXT NOT NULL,"
+        "  minor_units INTEGER NOT NULL,"
+        "  created_at TEXT NOT NULL"
+        ")"
+    )
+
+    with write_transaction(setup_conn) as cur:
+        cur.execute(
+            "INSERT INTO users(id, email, password_hash, display_name, handle, balance, currency, minor_units, created_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("u_alice", "a@x", "x", "Alice", "alice", 0, "EUR", 2, "2026-01-01T00:00:00+00:00"),
+        )
+
+    from app.idempotency.schema import apply_schema
+    apply_schema(setup_conn)
+    setup_conn.close()
+
+    yield path
+
+
+def _open_thread_conn(db_path: str) -> sqlite3.Connection:
+    """Open a per-thread SQLite connection (WAL + busy_timeout) for concurrent claim() calls."""
+    conn = sqlite3.connect(db_path, isolation_level=None, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 5000")
+    return conn
+
+
 def _payment_body(amount: int = 1500, note: str = "dinner", visibility: str = "public") -> dict:
     return {"to_handle": "bob", "amount": amount, "note": note, "visibility": visibility}
 
@@ -441,6 +493,150 @@ class TestEndToEnd:
         # 4) Conflict: same key, different body
         d3 = decide(conn, user_id="u_alice", endpoint="POST /payments", key="e2e", body=_payment_body(amount=9999))
         assert d3.is_conflict
+
+
+class TestConcurrentClaim:
+    """Concurrent claim() against the same key + same body.
+
+    SQLite serialises writes through ``BEGIN IMMEDIATE``: the first thread
+    to acquire the write lock inserts the row and wins; every other thread
+    that tries the same INSERT raises ``sqlite3.IntegrityError`` which
+    :func:`claim` catches and re-runs :func:`decide` on, returning
+    ``Outcome.REPLAY`` because the bodies are identical.
+    """
+
+    def test_two_concurrent_claims_same_body_one_winner_one_replay(self, isolated_db_path):
+        """Two concurrent claim() calls, same body → exactly 1 winner + 1 REPLAY-loser.
+
+        Each thread opens its own SQLite connection against the shared
+        ``isolated_db_path``; sharing a single ``Connection`` across threads
+        is unsafe regardless of ``check_same_thread``.
+        """
+        db_path = isolated_db_path
+        body = _payment_body()
+        key = "concurrent-same-body-2"
+
+        barrier = threading.Barrier(2)
+
+        def attempt(_thread_id: int) -> ClaimResult:
+            c = _open_thread_conn(db_path)
+            try:
+                barrier.wait()
+                return claim(
+                    c,
+                    user_id="u_alice",
+                    endpoint="POST /payments",
+                    key=key,
+                    body=body,
+                    response_status=201,
+                    response_body="",
+                    created_at="2026-09-24T11:04:03+00:00",
+                )
+            finally:
+                c.close()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(attempt, i) for i in range(2)]
+            results = [f.result() for f in as_completed(futures)]
+
+        winners = [r for r in results if r.is_winner]
+        losers = [r for r in results if not r.is_winner]
+
+        # Exactly one winner, one loser — never two winners and never zero.
+        assert len(winners) == 1
+        assert len(losers) == 1
+
+        winner = winners[0]
+        assert winner.outcome == Outcome.MISSING
+        assert winner.record is not None
+        assert winner.record.user_id == "u_alice"
+        assert winner.record.key == key
+        assert winner.record.request_body_hash == _body_hash(body)
+
+        loser = losers[0]
+        # The loser must be REPLAY (bodies are identical), never CONFLICT.
+        assert loser.outcome == Outcome.REPLAY
+        assert loser.is_replay
+        assert not loser.is_conflict
+        assert loser.record is not None
+        # The loser's stored record is the winner's record — same hash, same body.
+        assert loser.record.request_body_hash == winner.record.request_body_hash
+        assert loser.record.response_body == winner.record.response_body
+        assert loser.record.key == key
+
+        # Exactly one row persists in the store for the contested tuple.
+        verify_conn = _open_thread_conn(db_path)
+        try:
+            n = verify_conn.execute(
+                "SELECT COUNT(*) AS n FROM idempotency_keys "
+                "WHERE user_id = ? AND endpoint = ? AND key = ?",
+                ("u_alice", "POST /payments", key),
+            ).fetchone()["n"]
+            assert n == 1
+        finally:
+            verify_conn.close()
+
+    def test_many_concurrent_claims_same_body_single_winner_all_replay(self, isolated_db_path):
+        """N concurrent claim() calls, same body → 1 winner + (N-1) REPLAY-losers.
+
+        Stresses the race window beyond the 2-thread minimum so the test
+        still passes if the ordering of BEGIN IMMEDIATE acquisitions rotates.
+        Each thread opens its own SQLite connection against the shared
+        ``isolated_db_path``.
+        """
+        db_path = isolated_db_path
+        body = _payment_body()
+        key = "concurrent-same-body-many"
+
+        num_threads = 6
+        barrier = threading.Barrier(num_threads)
+
+        def attempt(_thread_id: int) -> ClaimResult:
+            c = _open_thread_conn(db_path)
+            try:
+                barrier.wait()
+                return claim(
+                    c,
+                    user_id="u_alice",
+                    endpoint="POST /payments",
+                    key=key,
+                    body=body,
+                    response_status=201,
+                    response_body="",
+                    created_at="2026-09-24T11:04:03+00:00",
+                )
+            finally:
+                c.close()
+
+        with ThreadPoolExecutor(max_workers=num_threads) as executor:
+            futures = [executor.submit(attempt, i) for i in range(num_threads)]
+            results = [f.result() for f in as_completed(futures)]
+
+        winners = [r for r in results if r.is_winner]
+        losers = [r for r in results if not r.is_winner]
+
+        # Exactly one winner, regardless of thread count.
+        assert len(winners) == 1
+        assert len(losers) == num_threads - 1
+
+        # Every loser must be REPLAY (bodies identical ⇒ never CONFLICT).
+        for loser in losers:
+            assert loser.outcome == Outcome.REPLAY
+            assert loser.is_replay
+            assert not loser.is_conflict
+            assert loser.record is not None
+            assert loser.record.request_body_hash == winners[0].record.request_body_hash
+
+        verify_conn = _open_thread_conn(db_path)
+        try:
+            n = verify_conn.execute(
+                "SELECT COUNT(*) AS n FROM idempotency_keys "
+                "WHERE user_id = ? AND endpoint = ? AND key = ?",
+                ("u_alice", "POST /payments", key),
+            ).fetchone()["n"]
+            assert n == 1
+        finally:
+            verify_conn.close()
 
 
 def _body_hash(body: dict) -> str:
