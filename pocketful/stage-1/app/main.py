@@ -15,6 +15,7 @@ from .api.auth import router as auth_router
 from .api.me import router as me_router
 from .api.payments import router as payments_router
 from .api.requests import router as requests_router
+from .authorizations import repository as authz_repo
 from .errors import error_response, http_exc_to_response
 
 
@@ -81,7 +82,13 @@ def test_reset(payload: dict[str, Any] = Body(default_factory=dict)) -> Response
     starting balance. Currency + minor_units are taken from the fixture and
     apply to the whole service. ST-1.3+ will extend this to seed payments
     and requests from the same payload.
+
+    Stage-2: also seeds authorisations (open holds) from the fixture's
+    ``authorizations`` array and validates that the sum of seeded open
+    holds per payer does not exceed that payer's seeded balance.
     """
+    from .authorizations.repository import AuthorizationSeedError
+
     currency = str(payload.get("currency", "EUR"))
     minor_units = int(payload.get("minor_units", 2))
 
@@ -90,9 +97,22 @@ def test_reset(payload: dict[str, Any] = Body(default_factory=dict)) -> Response
 
         raise_error(422, "validation_failed", "minor_units must be 0, 2 or 3")
 
+    raw_ttl = payload.get("authorization_ttl_seconds", 600)
+    if isinstance(raw_ttl, bool) or not isinstance(raw_ttl, int) or raw_ttl < 1:
+        from .errors import raise_error
+
+        raise_error(
+            422,
+            "validation_failed",
+            "authorization_ttl_seconds must be a positive integer",
+        )
+    authorization_ttl_seconds = raw_ttl
+
     conn = db_mod.get_connection()
     conn.execute("BEGIN IMMEDIATE")
     try:
+        conn.execute("DELETE FROM authorization_captures")
+        conn.execute("DELETE FROM authorizations")
         conn.execute("DELETE FROM tokens")
         conn.execute("DELETE FROM split_participants")
         conn.execute("DELETE FROM splits")
@@ -102,7 +122,8 @@ def test_reset(payload: dict[str, Any] = Body(default_factory=dict)) -> Response
         conn.execute("DELETE FROM idempotency_keys")
         conn.execute("DELETE FROM users")
         conn.execute(
-            "DELETE FROM service_meta WHERE key IN ('currency','minor_units')"
+            "DELETE FROM service_meta WHERE key IN "
+            "('currency','minor_units','authorization_ttl_seconds')"
         )
 
         conn.execute(
@@ -112,6 +133,11 @@ def test_reset(payload: dict[str, Any] = Body(default_factory=dict)) -> Response
         conn.execute(
             "INSERT INTO service_meta(key, value) VALUES('minor_units', ?)",
             (str(minor_units),),
+        )
+        conn.execute(
+            "INSERT INTO service_meta(key, value) VALUES"
+            "('authorization_ttl_seconds', ?)",
+            (str(authorization_ttl_seconds),),
         )
 
         for user in payload.get("users", []):
@@ -148,6 +174,30 @@ def test_reset(payload: dict[str, Any] = Body(default_factory=dict)) -> Response
                     minor_units,
                     _utc_now_iso(),
                 ),
+            )
+
+        raw_authorizations = payload.get("authorizations", []) or []
+        try:
+            authz_repo.validate_seed_authorizations(
+                conn, raw_authorizations, now_iso=_utc_now_iso()
+            )
+        except AuthorizationSeedError as exc:
+            from .errors import raise_error
+
+            raise_error(422, "validation_failed", str(exc))
+
+        for raw in raw_authorizations:
+            authz_repo.seed_authorization(
+                conn,
+                authorization_id=str(raw["id"]),
+                from_user_id=str(raw["from_user_id"]),
+                to_user_id=str(raw["to_user_id"]),
+                amount=int(raw["amount"]),
+                note=str(raw.get("note", "")),
+                visibility=str(raw.get("visibility", "public")),
+                status=str(raw.get("status", "open")),
+                expires_at=str(raw["expires_at"]),
+                created_at=_utc_now_iso(),
             )
         conn.execute("COMMIT")
     except Exception:

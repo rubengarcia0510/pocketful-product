@@ -16,7 +16,7 @@ from .config import get_port
 
 _DB_PATH_ENV = "POCKETFUL_DB_PATH"
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 
 def _default_db_path() -> str:
@@ -49,6 +49,8 @@ def init_schema(conn: sqlite3.Connection) -> None:
             _apply_v1(conn)
         if current < 2:
             _apply_v2(conn)
+        if current < 3:
+            _apply_v3(conn)
         conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
     finally:
         conn.execute("COMMIT")
@@ -185,6 +187,62 @@ def _apply_v2(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_split_parts_user ON split_participants(user_id)"
     )
+
+
+def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(row["name"] == column for row in rows)
+
+
+def _apply_v3(conn: sqlite3.Connection) -> None:
+    """Stage-2 schema: authorizations + extended-capture rows + payment linkage.
+
+    Stage-1 data is preserved unchanged. New tables and indexes are
+    idempotent (CREATE TABLE / INDEX IF NOT EXISTS). The ``payments`` table
+    gains a nullable ``authorization_id`` column via ADD COLUMN; we guard
+    the ADD with a column-existence check so the migration is safe on a
+    DB that already has it (e.g. after a crash mid-migration).
+    """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS authorizations ("
+        "  id TEXT PRIMARY KEY,"
+        "  from_user_id TEXT NOT NULL REFERENCES users(id),"
+        "  to_user_id TEXT NOT NULL REFERENCES users(id),"
+        "  amount INTEGER NOT NULL,"
+        "  captured_amount INTEGER NOT NULL DEFAULT 0,"
+        "  note TEXT NOT NULL DEFAULT '',"
+        "  visibility TEXT NOT NULL DEFAULT 'public',"
+        "  status TEXT NOT NULL CHECK (status IN ('open', 'captured', 'voided', 'expired')),"
+        "  expires_at TEXT NOT NULL,"
+        "  latest_payment_id TEXT REFERENCES payments(id),"
+        "  created_at TEXT NOT NULL,"
+        "  CHECK (amount >= 1),"
+        "  CHECK (captured_amount >= 0),"
+        "  CHECK (captured_amount <= amount)"
+        ")"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_authorizations_from ON authorizations(from_user_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_authorizations_to ON authorizations(to_user_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_authorizations_status ON authorizations(status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_authorizations_expires ON authorizations(expires_at)")
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS authorization_captures ("
+        "  authorization_id TEXT NOT NULL REFERENCES authorizations(id) ON DELETE CASCADE,"
+        "  seq INTEGER NOT NULL,"
+        "  payment_id TEXT NOT NULL REFERENCES payments(id),"
+        "  amount INTEGER NOT NULL,"
+        "  created_at TEXT NOT NULL,"
+        "  PRIMARY KEY (authorization_id, seq),"
+        "  CHECK (seq >= 1),"
+        "  CHECK (amount >= 1)"
+        ")"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_auth_captures_payment ON authorization_captures(payment_id)")
+
+    if not _column_exists(conn, "payments", "authorization_id"):
+        conn.execute("ALTER TABLE payments ADD COLUMN authorization_id TEXT REFERENCES authorizations(id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_payments_authorization ON payments(authorization_id)")
 
 
 def get_connection() -> sqlite3.Connection:
