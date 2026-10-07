@@ -337,7 +337,8 @@ def pay_request(
         raise_error(409, "request_not_pending", f"request is already {request_row['status']}")
 
     amount = request_row["amount"]
-    available = authz_repo.available_for_user(user_id)
+    created_at = _utc_now_iso()
+    _, available, _ = authz_repo.available_for_user(conn, user_id, now_iso=created_at)
     if available < amount:
         raise_error(409, "insufficient_funds", "payer has insufficient available balance")
 
@@ -349,7 +350,6 @@ def pay_request(
     ).fetchone()
 
     payment_id = f"p_{secrets.token_hex(8)}"
-    created_at = _utc_now_iso()
     note_str = request_row["note"] if request_row["note"] else ""
 
     try:
