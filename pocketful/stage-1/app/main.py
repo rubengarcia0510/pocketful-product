@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse, Response
 
 from . import db as db_mod
 from .api.auth import router as auth_router
+from .api.authorizations import router as authorizations_router
 from .api.me import router as me_router
 from .api.payments import router as payments_router
 from .api.requests import router as requests_router
@@ -30,6 +31,7 @@ app.include_router(auth_router)
 app.include_router(me_router)
 app.include_router(payments_router)
 app.include_router(requests_router)
+app.include_router(authorizations_router)
 
 
 @app.exception_handler(RequestValidationError)
