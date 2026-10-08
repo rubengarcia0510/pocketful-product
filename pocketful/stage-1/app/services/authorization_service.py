@@ -53,6 +53,8 @@ from ..models.balance import AmountError, validate_amount
 
 CREATE_ENDPOINT = "POST /authorizations"
 CAPTURE_ENDPOINT = "POST /authorizations/{id}/captures"
+CAPTURE_ENDPOINT_SINGULAR = "POST /authorizations/{id}/capture"
+VOID_ENDPOINT = "POST /authorizations/{id}/void"
 
 MAX_NOTE_LEN = 200
 ALLOWED_VISIBILITY = frozenset({"public", "private"})
@@ -374,18 +376,26 @@ def capture_authorization(
             "only the receiver may capture this authorization",
         )
 
-    if record.status != "open":
-        raise_error(
-            409,
-            "authorization_not_open",
-            "authorization is not open",
-        )
-
     if record.expires_at <= now_iso:
+        # Spec §API requires reads and writes to reflect expiry even if no
+        # request occurred at the deadline. Persist the transition so the
+        # row's stored status matches the visible one and subsequent reads
+        # do not have to re-derive it.
+        with write_transaction(conn) as cur:
+            cur.execute("SELECT 1")
+            authz_repo.set_status(conn, authorization_id, "expired")
         raise_error(
             409,
             "authorization_expired",
             "authorization has expired",
+        )
+
+    if record.status != "open":
+        # captured, voided, or already-persisted expired
+        raise_error(
+            409,
+            "authorization_not_open",
+            "authorization is not open",
         )
 
     remaining = max(0, record.amount - record.captured_amount)
@@ -452,24 +462,39 @@ def capture_authorization(
                 now_iso,
             ),
         )
-        authz_repo.add_to_captured_amount(
-            conn, authorization_id, amount_i
+        cur.execute(
+            "UPDATE authorizations SET captured_amount = captured_amount + ? WHERE id = ?",
+            (amount_i, authorization_id),
         )
         captures = authz_repo.list_captures(conn, authorization_id)
         next_seq = len(captures) + 1
-        authz_repo.insert_capture(
-            conn,
-            authorization_id=authorization_id,
-            seq=next_seq,
-            payment_id=payment_id,
-            amount=amount_i,
-            created_at=now_iso,
+        cur.execute(
+            "INSERT INTO authorization_captures(authorization_id, seq, payment_id, amount, created_at) VALUES (?, ?, ?, ?, ?)",
+            (authorization_id, next_seq, payment_id, amount_i, now_iso),
         )
-        authz_repo.set_latest_payment(conn, authorization_id, payment_id)
+        cur.execute(
+            "UPDATE authorizations SET latest_payment_id = ? WHERE id = ?",
+            (payment_id, authorization_id),
+        )
         new_captured = record.captured_amount + amount_i
         closed = final_b and new_captured >= record.amount
+
+        # Spec §API: "releases the uncaptured remainder immediately" on final capture.
+        # The hold never moved money; capture moves the captured amount from
+        # payer to receiver. On final capture the remainder is released back
+        # to the payer's available balance.
+        remainder = 0
         if closed:
-            authz_repo.set_status(conn, authorization_id, "captured")
+            remainder = record.amount - new_captured
+            if remainder > 0:
+                cur.execute(
+                    "UPDATE users SET balance = balance + ? WHERE id = ?",
+                    (remainder, payer["id"]),
+                )
+            cur.execute(
+                "UPDATE authorizations SET status = ? WHERE id = ?",
+                ("captured", authorization_id),
+            )
         cur.execute(
             "INSERT INTO idempotency_keys("
             "  user_id, endpoint, key, request_body_hash,"
@@ -509,11 +534,257 @@ def capture_authorization(
     return response, 201
 
 
+def _build_authorization_response(
+    record: authz_repo.AuthorizationRecord,
+    *,
+    from_handle: str,
+    to_handle: str,
+    currency: str,
+) -> dict:
+    """Build the spec-shaped response for an authorisation."""
+    captures = authz_repo.list_captures(_db(), record.id)
+    fields = authz_repo.presentation_fields(record, captures, now_iso=_utc_now_iso())
+    return {
+        "authorization_id": record.id,
+        "from_user_id": record.from_user_id,
+        "from_handle": from_handle,
+        "to_user_id": record.to_user_id,
+        "to_handle": to_handle,
+        "amount": record.amount,
+        "captured_amount": fields["captured_amount"],
+        "currency": currency,
+        "note": record.note,
+        "visibility": record.visibility,
+        "status": fields["status"],
+        "expires_at": record.expires_at,
+        "payment_id": fields["payment_id"],
+        "payment_ids": fields["payment_ids"],
+        "remaining_amount": fields["remaining_amount"],
+        "created_at": record.created_at,
+    }
+
+
+def _db() -> sqlite3.Connection:
+    """Internal helper: singleton database connection."""
+    return db_mod.get_connection()
+
+
+def _build_void_response(
+    record: authz_repo.AuthorizationRecord,
+    captures: list[authz_repo.AuthorizationCaptureRecord],
+    *,
+    from_handle: str,
+    to_handle: str,
+    currency: str,
+) -> dict:
+    """Build the spec-shaped response for a void operation."""
+    fields = authz_repo.presentation_fields(record, captures, now_iso=_utc_now_iso())
+    return {
+        "authorization_id": record.id,
+        "from_user_id": record.from_user_id,
+        "from_handle": from_handle,
+        "to_user_id": record.to_user_id,
+        "to_handle": to_handle,
+        "amount": record.amount,
+        "captured_amount": fields["captured_amount"],
+        "currency": currency,
+        "note": record.note,
+        "visibility": record.visibility,
+        "status": fields["status"],
+        "expires_at": record.expires_at,
+        "payment_id": fields["payment_id"],
+        "payment_ids": fields["payment_ids"],
+        "remaining_amount": fields["remaining_amount"],
+        "created_at": record.created_at,
+    }
+
+
+def void_authorization(
+    user_id: str,
+    authorization_id: str,
+) -> tuple[dict, int]:
+    """Void an open authorisation (spec §API ``POST /authorizations/{id}/void``).
+
+    Only the **payer** (``from_user_id``) may void. No idempotency key is
+    required (the spec says: "No idempotency key, like decline and cancel.").
+
+    State transitions:
+      * ``open`` (not expired by clock) → ``voided`` (200 with new state).
+      * ``voided`` → 200 with current state (idempotent no-op).
+      * ``captured`` or ``expired`` (by clock or by row) → 409
+        ``authorization_not_open``.
+      * Unknown id → 404 ``not_found``.
+      * Caller is not the payer (including callers who are neither party)
+        → 403 ``forbidden``.
+
+    Voiding does not move money: holds never moved it. It just releases the
+    reserved amount and updates ``status``.
+    """
+    conn = _db()
+    now_iso = _utc_now_iso()
+
+    try:
+        record = authz_repo.get_authorization(
+            conn, authorization_id, now_iso=now_iso
+        )
+    except AuthorizationNotFound:
+        raise_error(404, "not_found", "authorization not found")
+
+    if record.from_user_id != user_id:
+        raise_error(
+            403,
+            "forbidden",
+            "only the payer may void this authorization",
+        )
+
+    if record.status == "voided":
+        captures = authz_repo.list_captures(conn, authorization_id)
+        response = _build_void_response(
+            record,
+            captures,
+            from_handle=_user_handle(conn, record.from_user_id),
+            to_handle=_user_handle(conn, record.to_user_id),
+            currency=_currency(conn),
+        )
+        return response, 200
+
+    if record.expires_at <= now_iso and record.status == "open":
+        # Persist the expiry transition before rejecting, mirroring the
+        # capture path: reads and writes must reflect expiry even when no
+        # request happened at the deadline.
+        with write_transaction(conn) as cur:
+            cur.execute("SELECT 1")
+            authz_repo.set_status(conn, authorization_id, "expired")
+        raise_error(
+            409,
+            "authorization_not_open",
+            "authorization is expired",
+        )
+
+    if record.status != "open":
+        # captured, voided, or already-persisted expired
+        raise_error(
+            409,
+            "authorization_not_open",
+            f"authorization is {record.status}",
+        )
+
+    # The expires_at clock check above catches open-but-past; here the auth
+    # is truly open and not yet expired.
+
+    from_handle = _user_handle(conn, record.from_user_id)
+    to_handle = _user_handle(conn, record.to_user_id)
+    currency = _currency(conn)
+    captures = authz_repo.list_captures(conn, authorization_id)
+
+    with write_transaction(conn) as cur:
+        cur.execute("SELECT 1")
+        authz_repo.set_status(conn, authorization_id, "voided")
+
+    refreshed = authz_repo.get_authorization(conn, authorization_id, now_iso=now_iso)
+    response = _build_void_response(
+        refreshed,
+        captures,
+        from_handle=from_handle,
+        to_handle=to_handle,
+        currency=currency,
+    )
+    return response, 200
+
+
+def _user_handle(conn: sqlite3.Connection, user_id: str) -> str:
+    """Return the handle for ``user_id``. Empty string if the user row is gone."""
+    row = conn.execute(
+        "SELECT handle FROM users WHERE id = ?", (user_id,)
+    ).fetchone()
+    if row is None:
+        return ""
+    return str(row["handle"])
+
+
+def list_authorizations(
+    user_id: str,
+    *,
+    direction: str | None = None,
+    status: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict:
+    """List authorisations for ``user_id`` (spec §API ``GET /authorizations``).
+
+    Authorisations where the caller is the payer or the receiver, and no
+    others. Newest first by ``created_at``. Expiry-by-clock is applied so a
+    ``open`` row past its ``expires_at`` matches ``status="expired"``.
+
+    Returns a dict ``{"authorizations": [...], "has_more": bool}`` mirroring
+    the ``GET /requests`` shape so the UI can paginate uniformly.
+    """
+    if not isinstance(limit, int) or limit < 1 or limit > 200:
+        raise_error(
+            422,
+            "validation_failed",
+            "limit must be an integer from 1 to 200",
+        )
+    if not isinstance(offset, int) or offset < 0:
+        raise_error(
+            422, "validation_failed", "offset must be 0 or more"
+        )
+    if direction is not None and direction not in {"incoming", "outgoing"}:
+        raise_error(
+            422,
+            "validation_failed",
+            "direction must be 'incoming' or 'outgoing'",
+        )
+    if status is not None and status not in {
+        "open",
+        "captured",
+        "voided",
+        "expired",
+    }:
+        raise_error(
+            422,
+            "validation_failed",
+            "status must be one of open|captured|voided|expired",
+        )
+
+    conn = _db()
+    now_iso = _utc_now_iso()
+    currency = _currency(conn)
+
+    records, has_more = authz_repo.list_authorizations_for_user(
+        conn,
+        user_id,
+        direction=direction,
+        status=status,
+        limit=limit,
+        offset=offset,
+        now_iso=now_iso,
+    )
+
+    items = []
+    for rec in records:
+        captures = authz_repo.list_captures(conn, rec.id)
+        items.append(
+            _build_authorization_response(
+                rec,
+                from_handle=_user_handle(conn, rec.from_user_id),
+                to_handle=_user_handle(conn, rec.to_user_id),
+                currency=currency,
+            )
+        )
+
+    return {"authorizations": items, "has_more": has_more}
+
+
 __all__ = [
     "CREATE_ENDPOINT",
     "CAPTURE_ENDPOINT",
+    "CAPTURE_ENDPOINT_SINGULAR",
+    "VOID_ENDPOINT",
     "create_authorization",
     "capture_authorization",
+    "void_authorization",
+    "list_authorizations",
     "MAX_NOTE_LEN",
     "ALLOWED_VISIBILITY",
 ]
